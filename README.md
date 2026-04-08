@@ -1,6 +1,5 @@
 # aws-static-site
 
-## Suggested GitHub Repository Description
 Deploys a static website to Amazon S3 and serves it securely through CloudFront using automated Python deployment scripts.
 
 Topics: `aws`, `cloudfront`, `s3`, `boto3`, `infrastructure-automation`, `python`

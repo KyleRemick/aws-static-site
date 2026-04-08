@@ -26,30 +26,16 @@ def create_bucket(s3_client, region, bucket_name):
         )
 
 
-def configure_public_bucket(s3_client, bucket_name):
+def configure_private_bucket(s3_client, bucket_name):
     s3_client.put_public_access_block(
         Bucket=bucket_name,
         PublicAccessBlockConfiguration={
-            "BlockPublicAcls": False,
-            "IgnorePublicAcls": False,
-            "BlockPublicPolicy": False,
-            "RestrictPublicBuckets": False,
+            "BlockPublicAcls": True,
+            "IgnorePublicAcls": True,
+            "BlockPublicPolicy": True,
+            "RestrictPublicBuckets": True,
         },
     )
-
-    policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Sid": "PublicReadForStaticSite",
-                "Effect": "Allow",
-                "Principal": "*",
-                "Action": "s3:GetObject",
-                "Resource": f"arn:aws:s3:::{bucket_name}/*",
-            }
-        ],
-    }
-    s3_client.put_bucket_policy(Bucket=bucket_name, Policy=json.dumps(policy))
 
 
 def upload_index(s3_client, bucket_name):
@@ -61,7 +47,20 @@ def upload_index(s3_client, bucket_name):
     )
 
 
-def create_distribution(cloudfront_client, bucket_name, region):
+def create_origin_access_control(cloudfront_client, bucket_name):
+    response = cloudfront_client.create_origin_access_control(
+        OriginAccessControlConfig={
+            "Name": f"{bucket_name}-oac",
+            "Description": "Access control for private S3 origin",
+            "SigningProtocol": "sigv4",
+            "SigningBehavior": "always",
+            "OriginAccessControlOriginType": "s3",
+        }
+    )
+    return response["OriginAccessControl"]["Id"]
+
+
+def create_distribution(cloudfront_client, bucket_name, region, oac_id):
     if region == "us-east-1":
         origin_domain = f"{bucket_name}.s3.amazonaws.com"
     else:
@@ -80,6 +79,7 @@ def create_distribution(cloudfront_client, bucket_name, region):
                     {
                         "Id": origin_id,
                         "DomainName": origin_domain,
+                        "OriginAccessControlId": oac_id,
                         "S3OriginConfig": {"OriginAccessIdentity": ""},
                     }
                 ],
@@ -105,6 +105,29 @@ def create_distribution(cloudfront_client, bucket_name, region):
     return distribution["Id"], distribution["DomainName"]
 
 
+def apply_bucket_policy_for_cloudfront(s3_client, bucket_name, distribution_id, account_id):
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowCloudFrontServicePrincipalReadOnly",
+                "Effect": "Allow",
+                "Principal": {"Service": "cloudfront.amazonaws.com"},
+                "Action": "s3:GetObject",
+                "Resource": f"arn:aws:s3:::{bucket_name}/*",
+                "Condition": {
+                    "StringEquals": {
+                        "AWS:SourceArn": (
+                            f"arn:aws:cloudfront::{account_id}:distribution/{distribution_id}"
+                        )
+                    }
+                },
+            }
+        ],
+    }
+    s3_client.put_bucket_policy(Bucket=bucket_name, Policy=json.dumps(policy))
+
+
 def main():
     if not INDEX_FILE.exists():
         raise FileNotFoundError(f"Missing {INDEX_FILE}")
@@ -113,14 +136,18 @@ def main():
     region = session.region_name or "us-east-1"
     s3 = session.client("s3", region_name=region)
     cloudfront = session.client("cloudfront")
+    sts = session.client("sts")
 
     bucket_name = make_bucket_name()
     create_bucket(s3, region, bucket_name)
-    configure_public_bucket(s3, bucket_name)
+    configure_private_bucket(s3, bucket_name)
     upload_index(s3, bucket_name)
+    oac_id = create_origin_access_control(cloudfront, bucket_name)
     distribution_id, distribution_domain = create_distribution(
-        cloudfront, bucket_name, region
+        cloudfront, bucket_name, region, oac_id
     )
+    account_id = sts.get_caller_identity()["Account"]
+    apply_bucket_policy_for_cloudfront(s3, bucket_name, distribution_id, account_id)
 
     state = {
         "bucket_name": bucket_name,
